@@ -54,7 +54,9 @@ lock_nums=1000000
   --lock_nums arg (=0)           lock node nums, the lock nodes will not 
                                  participate in the follow LDG paritioning
   -B [ --block_size ] arg (=1)   block size for one partition, 1 for 4KB, 2 for
-                                 8KB and so on.
+                                 8KB, and 4 for 16KB. This must match the
+                                 graph_page_bytes stored in the disk-index
+                                 metadata.
   -L [ --ldg_times ] arg (=4)    exec ldg partition alg times, usually 8 is 
                                  enough.
   --use_disk arg (=1)            Use 1 for use disk index (default), 0 for 

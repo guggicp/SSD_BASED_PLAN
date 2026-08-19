@@ -76,6 +76,8 @@ std::pair<bool, std::vector<_u64>> get_disk_index_meta(const std::string &path) 
   int meta_n, meta_dim;
   const int expected_new_meta_n = 9;
   const int expected_new_meta_n_with_reorder_data = 12;
+  const int expected_paged_meta_n = 10;
+  const int expected_paged_meta_n_with_reorder_data = 13;
   const int old_meta_n = 11;
   bool is_new_version = true;
   std::vector<_u64> metas;
@@ -83,7 +85,10 @@ std::pair<bool, std::vector<_u64>> get_disk_index_meta(const std::string &path) 
   fin.read((char *)(&meta_n), sizeof(int));
   fin.read((char *)(&meta_dim), sizeof(int));
 
-  if (meta_n == expected_new_meta_n || meta_n == expected_new_meta_n_with_reorder_data) {
+  if (meta_n == expected_new_meta_n ||
+      meta_n == expected_new_meta_n_with_reorder_data ||
+      meta_n == expected_paged_meta_n ||
+      meta_n == expected_paged_meta_n_with_reorder_data) {
     metas.resize(meta_n);
     fin.read((char *)(metas.data()), sizeof(_u64) * meta_n);
   } else {
@@ -295,20 +300,42 @@ class graph_partitioner {
 
       _max_node_len = meta_pair.second[3];
       C = meta_pair.second[4];
+      const _u64 graph_page_bytes =
+          meta_pair.first &&
+                  (meta_pair.second.size() == 10 ||
+                   meta_pair.second.size() == 13)
+              ? meta_pair.second[meta_pair.second.size() - 2]
+              : SECTOR_LEN;
+      const _u64 requested_page_bytes = SECTOR_LEN * (_u64) BS;
+      if (graph_page_bytes != requested_page_bytes) {
+        std::cout << "graph page mismatch: index metadata="
+                  << graph_page_bytes << " bytes, --block_size requests "
+                  << requested_page_bytes << " bytes" << std::endl;
+        exit(-1);
+      }
+      if (C == 0 || C != graph_page_bytes / _max_node_len) {
+        std::cout << "invalid graph page metadata: C=" << C
+                  << " graph_page_bytes=" << graph_page_bytes
+                  << " max_node_len=" << _max_node_len << std::endl;
+        exit(-1);
+      }
 
       _partition_number = ROUND_UP(_nd, C) / C;
 
-      std::unique_ptr<char[]> mem_index = std::make_unique<char[]>(_partition_number * SECTOR_LEN);
+      std::unique_ptr<char[]> mem_index =
+          std::make_unique<char[]>(_partition_number * graph_page_bytes);
       in.open(index_name, std::ios::binary);
       in.seekg(SECTOR_LEN, std::ios::beg);
-      in.read(mem_index.get(), _partition_number * SECTOR_LEN);
+      in.read(mem_index.get(), _partition_number * graph_page_bytes);
       in.close();
       full_graph.resize(_nd);
       _u64 des = 0;
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : des)
       for (unsigned i = 0; i < _partition_number; i++) {
-        std::unique_ptr<char[]> sector_buf = std::make_unique<char[]>(SECTOR_LEN);
-        memcpy(sector_buf.get(), mem_index.get() + i * SECTOR_LEN, SECTOR_LEN);
+        std::unique_ptr<char[]> sector_buf =
+            std::make_unique<char[]>(graph_page_bytes);
+        memcpy(sector_buf.get(),
+               mem_index.get() + i * graph_page_bytes, graph_page_bytes);
         for (unsigned j = 0; j < C && i * C + j < _nd; j++) {
           std::unique_ptr<char[]> node_buf = std::make_unique<char[]>(_max_node_len);
           memcpy(node_buf.get(), sector_buf.get() + j * _max_node_len, _max_node_len);
@@ -322,7 +349,6 @@ class graph_partitioner {
       }
       std::cout << "avg degree: " << (double)des / _nd << std::endl;
       mem_index.reset();
-      C = (SECTOR_LEN * BS) / _max_node_len;
       _partition_number = ROUND_UP(_nd, C) / C;
       std::cout << "_nd: " << _nd << " _dim:" << _dim << " C:" << C << " pn:" << _partition_number << std::endl;
       std::cout << "load index over." << std::endl;
