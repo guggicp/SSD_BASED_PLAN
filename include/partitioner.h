@@ -14,7 +14,9 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <fcntl.h>
 #include <fstream>
+#include <unistd.h>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -322,33 +324,53 @@ class graph_partitioner {
 
       _partition_number = ROUND_UP(_nd, C) / C;
 
-      std::unique_ptr<char[]> mem_index =
-          std::make_unique<char[]>(_partition_number * graph_page_bytes);
-      in.open(index_name, std::ios::binary);
-      in.seekg(SECTOR_LEN, std::ios::beg);
-      in.read(mem_index.get(), _partition_number * graph_page_bytes);
-      in.close();
+      // Stream the graph region in parallel blocks. A whole-file buffer
+      // scales with node count (nodes * graph_page_bytes) and exceeds RAM
+      // at 100M+ nodes. Each worker preads its own block at an explicit
+      // offset (thread-safe, no shared file position) and parses it in
+      // place, so bytes, node order, and results are identical to the
+      // previous whole-file version while peak memory stays at the CSR
+      // copies plus a fixed per-worker block window.
       full_graph.resize(_nd);
       _u64 des = 0;
+      const int graph_fd = ::open(index_name, O_RDONLY);
+      if (graph_fd < 0) {
+        std::cout << "open file " << index_name << " error!" << std::endl;
+        exit(-1);
+      }
+      const _u64 block_bytes = 32u << 20;  // 32 MiB per worker read
+      const _u64 block_pages =
+          block_bytes / graph_page_bytes > 0 ? block_bytes / graph_page_bytes : 1;
 #pragma omp parallel for schedule(dynamic, 1) reduction(+ : des)
-      for (unsigned i = 0; i < _partition_number; i++) {
-        std::unique_ptr<char[]> sector_buf =
-            std::make_unique<char[]>(graph_page_bytes);
-        memcpy(sector_buf.get(),
-               mem_index.get() + i * graph_page_bytes, graph_page_bytes);
-        for (unsigned j = 0; j < C && i * C + j < _nd; j++) {
-          std::unique_ptr<char[]> node_buf = std::make_unique<char[]>(_max_node_len);
-          memcpy(node_buf.get(), sector_buf.get() + j * _max_node_len, _max_node_len);
-          unsigned &nnbr = *(unsigned *)(node_buf.get() + _dim * sizeof(T));
-          unsigned *nhood_buf = (unsigned *)(node_buf.get() + (_dim * sizeof(T)) + sizeof(unsigned));
-          std::vector<unsigned> tmp(nnbr);
-          des += nnbr;
-          memcpy((char *)tmp.data(), nhood_buf, nnbr * sizeof(unsigned));
-          full_graph[i * C + j].assign(tmp.begin(), tmp.end());
+      for (_u64 b = 0; b < (_u64)_partition_number; b += block_pages) {
+        const _u64 pages =
+            (_partition_number - b) < block_pages ? (_partition_number - b) : block_pages;
+        std::unique_ptr<char[]> block_buf =
+            std::make_unique<char[]>(pages * graph_page_bytes);
+        _u64 got = 0;
+        while (got < pages * graph_page_bytes) {
+          ssize_t r = ::pread(graph_fd, block_buf.get() + got,
+                              pages * graph_page_bytes - got,
+                              (off_t)(SECTOR_LEN + b * graph_page_bytes + got));
+          if (r <= 0) break;
+          got += (_u64)r;
+        }
+        for (_u64 i = b; i < b + pages; i++) {
+          char *sector = block_buf.get() + (i - b) * graph_page_bytes;
+          for (unsigned j = 0; j < C && i * C + j < _nd; j++) {
+            char *node_buf = sector + (size_t)j * _max_node_len;
+            unsigned &nnbr = *(unsigned *)(node_buf + _dim * sizeof(T));
+            unsigned *nhood_buf =
+                (unsigned *)(node_buf + (_dim * sizeof(T)) + sizeof(unsigned));
+            std::vector<unsigned> tmp(nnbr);
+            des += nnbr;
+            memcpy((char *)tmp.data(), nhood_buf, nnbr * sizeof(unsigned));
+            full_graph[i * C + j].assign(tmp.begin(), tmp.end());
+          }
         }
       }
       std::cout << "avg degree: " << (double)des / _nd << std::endl;
-      mem_index.reset();
+      ::close(graph_fd);
       _partition_number = ROUND_UP(_nd, C) / C;
       std::cout << "_nd: " << _nd << " _dim:" << _dim << " C:" << C << " pn:" << _partition_number << std::endl;
       std::cout << "load index over." << std::endl;
